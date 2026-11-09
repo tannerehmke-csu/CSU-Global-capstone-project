@@ -1,0 +1,173 @@
+/* Generated Code (IMPORT) */
+/* Source File: MIS581 Capstone.xlsx */
+/* Source Path: /home/u63901149/MIS581 */
+/* Code generated on: 10/31/26, 7:49 PM */
+
+%web_drop_table(WORK.IMPORT);
+
+
+FILENAME REFFILE '/home/u63901149/MIS581/MIS581 Capstone.xlsx';
+
+PROC IMPORT DATAFILE=REFFILE
+	DBMS=XLSX
+	OUT=WORK.IMPORT;
+	GETNAMES=YES;
+RUN;
+
+PROC CONTENTS DATA=WORK.IMPORT; RUN;
+
+
+%web_open_table(WORK.IMPORT);
+/*====================================================================
+  Binary classification metrics in SAS Studio
+  Dependent variable  : Corn_Price_Up_5Pct (event = 1)
+  Independent variables: Commercial_Position_Change Managed_Money_Position_Change Commercial_Pct_of_OI Managed_Money_Pct_of_OI
+  Metrics: MCC, Accuracy, F1, Sensitivity, Specificity, Precision (PPV),
+           NPV, Cohen's kappa, ROC AUC, Precision-Recall AUC
+====================================================================*/
+
+/*---- User settings ------------------------------------------------*/
+%let cutoff = 0.5;           /* classification threshold if FIXED      */
+%let cutoff_method = FIXED;  /* FIXED = use &cutoff ; YOUDEN = cutoff
+                                that maximizes sensitivity+specificity-1 */
+
+ods graphics on;
+
+/*---- 1. Logistic model, with outputs added -------------------*/
+proc logistic data=WORK.IMPORT plots(only)=roc;
+	model Corn_Price_Up_5Pct(event='1')=Commercial_Position_Change Managed_Money_Position_Change Commercial_Pct_of_OI Managed_Money_Pct_of_OI / link=logit 
+		technique=fisher
+		outroc=work.rocdata;
+	output out=work.scored predicted=phat;
+	ods output Association=work.assoc;
+run;
+
+/*---- 2. Keep only observations actually scored --------------------*/
+data work.scored2;
+	set work.scored;
+	where not missing(phat) and not missing(Corn_Price_Up_5Pct);
+	y = (Corn_Price_Up_5Pct = 1);
+run;
+
+/*---- 3. Optional Youden-optimal cutoff ----------------------------*/
+data _null_;
+	set work.rocdata end=last;
+	retain best -1 bestp .;
+	j = _sensit_ - _1mspec_;
+	if j > best then do;
+		best = j;
+		bestp = _prob_;
+	end;
+	if last and upcase("&cutoff_method") = 'YOUDEN' then
+		call symputx('cutoff', bestp);
+run;
+
+%put NOTE: Classification cutoff used = &cutoff;
+
+/*---- 4. Confusion matrix counts -----------------------------------*/
+proc sql noprint;
+	select sum(y=1 and phat>=&cutoff),
+	       sum(y=0 and phat>=&cutoff),
+	       sum(y=0 and phat<&cutoff),
+	       sum(y=1 and phat<&cutoff),
+	       sum(y=1),
+	       sum(y=0)
+	into :TP trimmed, :FP trimmed, :TN trimmed, :FN trimmed,
+	     :NPOS trimmed, :NNEG trimmed
+	from work.scored2;
+quit;
+
+/*---- 5. AUC of ROC (c statistic from PROC LOGISTIC) ---------------*/
+proc sql noprint;
+	select nValue2 into :auc_roc trimmed
+	from work.assoc
+	where Label2 = 'c';
+quit;
+
+/*---- 6. Precision-Recall curve and its AUC ------------------------*/
+proc sql;
+	create table work.byprob as
+	select phat, sum(y=1) as pos, sum(y=0) as neg
+	from work.scored2
+	group by phat
+	order by phat desc;
+quit;
+
+data work.pr;
+	set work.byprob end=last;
+	retain tp_c 0 fp_c 0 prev_recall 0 prev_prec . ap 0 auc_pr_trap 0;
+	tp_c + pos;
+	fp_c + neg;
+	precision = tp_c / (tp_c + fp_c);
+	recall    = tp_c / &NPOS;
+	if _n_ = 1 then prev_prec = precision;
+	ap          + (recall - prev_recall) * precision;                       /* step-wise (average precision) */
+	auc_pr_trap + (recall - prev_recall) * (precision + prev_prec) / 2;     /* trapezoidal */
+	prev_recall = recall;
+	prev_prec   = precision;
+	if last then do;
+		call symputx('auc_pr_ap',   ap);
+		call symputx('auc_pr_trap', auc_pr_trap);
+	end;
+run;
+
+/*---- 7. Threshold-based metrics -----------------------------------*/
+data work.metrics;
+	TP = &TP; FP = &FP; TN = &TN; FN = &FN;
+	N  = TP + FP + TN + FN;
+	Cutoff = &cutoff;
+
+	Accuracy    = (TP + TN) / N;
+	Sensitivity = ifn((TP+FN)>0, TP / (TP + FN), .);
+	Specificity = ifn((TN+FP)>0, TN / (TN + FP), .);
+	Precision   = ifn((TP+FP)>0, TP / (TP + FP), .);
+	NPV         = ifn((TN+FN)>0, TN / (TN + FN), .);
+	F1          = ifn((2*TP+FP+FN)>0, 2*TP / (2*TP + FP + FN), .);
+
+	denom = sqrt((TP+FP) * (TP+FN) * (TN+FP) * (TN+FN));
+	MCC   = ifn(denom>0, (TP*TN - FP*FN) / denom, 0);
+
+	po = (TP + TN) / N;
+	pe = ((TP+FP)*(TP+FN) + (FN+TN)*(FP+TN)) / (N*N);
+	Cohens_Kappa = ifn(pe<1, (po - pe) / (1 - pe), .);
+
+	AUC_ROC           = &auc_roc;
+	AUC_PR_AvgPrec    = &auc_pr_ap;
+	AUC_PR_Trapezoid  = &auc_pr_trap;
+
+	drop denom po pe;
+run;
+
+/*---- 8. Report ----------------------------------------------------*/
+title "Confusion Matrix Counts (cutoff = &cutoff)";
+proc print data=work.metrics noobs;
+	var N TP FP TN FN;
+run;
+
+title "Classification Performance: Corn_Price_Up_5Pct ~ four predictors (multivariate)";
+proc print data=work.metrics noobs;
+	var Cutoff Accuracy Sensitivity Specificity Precision NPV F1 MCC
+	    Cohens_Kappa AUC_ROC AUC_PR_AvgPrec AUC_PR_Trapezoid;
+	format Accuracy Sensitivity Specificity Precision NPV F1 MCC
+	       Cohens_Kappa AUC_ROC AUC_PR_AvgPrec AUC_PR_Trapezoid 6.4;
+run;
+
+/*---- 9. Plots -----------------------------------------------------*/
+title "Precision-Recall Curve";
+proc sgplot data=work.pr;
+	series x=recall y=precision / markers;
+	refline %sysevalf(&NPOS/(&NPOS+&NNEG)) / axis=y lineattrs=(pattern=dash)
+		label="No-skill (prevalence)";
+	xaxis label="Recall (Sensitivity)" min=0 max=1;
+	yaxis label="Precision (PPV)" min=0 max=1;
+run;
+
+title "ROC Curve";
+proc sgplot data=work.rocdata;
+	series x=_1mspec_ y=_sensit_;
+	lineparm x=0 y=0 slope=1 / lineattrs=(pattern=dash);
+	xaxis label="1 - Specificity" min=0 max=1;
+	yaxis label="Sensitivity" min=0 max=1;
+run;
+
+title;
